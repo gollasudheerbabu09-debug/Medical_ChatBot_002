@@ -6,6 +6,12 @@ with a **Gradio** chat interface.
 
 > Educational project — not medical advice.
 
+
+https://github.com/user-attachments/assets/45289188-6032-4436-b96c-6c47dcaaaf17
+
+
+
+
 **Fine-tuned LoRA adapter (Hugging Face Hub):** https://huggingface.co/Sudheer2002/qwen2.5-1.5b-medquad-qlora
 
 ## Architecture
