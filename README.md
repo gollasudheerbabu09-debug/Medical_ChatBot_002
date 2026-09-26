@@ -1,55 +1,75 @@
 # 🩺 MedAI — Medical QA with Qwen2.5 + QLoRA + RAG (FAISS)
 
-A medical question-answering assistant built by fine-tuning **Qwen2.5-7B-Instruct** with **QLoRA** on the
+A medical question-answering assistant built by fine-tuning **Qwen2.5-1.5B-Instruct** with **QLoRA** on the
 **MedQuAD** dataset and grounding answers with **retrieval-augmented generation** (sentence embeddings + FAISS),
-served through a **Gradio** app on **Hugging Face Spaces**.
+with a **Gradio** chat interface.
 
 > Educational project — not medical advice.
 
-**Live demo:** `https://huggingface.co/spaces/<your-hf-username>/MedAI`  
-**LoRA adapter:** `https://huggingface.co/<your-hf-username>/qwen2.5-7b-medquad-qlora`
+**Fine-tuned LoRA adapter (Hugging Face Hub):** https://huggingface.co/Sudheer2002/qwen2.5-1.5b-medquad-qlora
 
 ## Architecture
 ```
-TRAINING   MedQuAD -> clean/dedupe -> Qwen chat template -> train/val/test (80/10/10)
-           -> Qwen tokenizer -> 4-bit NF4 frozen Qwen + LoRA (r=16, attn + MLP)
-           -> cross-entropy on answer tokens -> backprop -> paged 8-bit AdamW -> LoRA adapter
+TRAINING   MedQuAD (16,359 QA pairs after cleaning) -> Qwen chat template -> train/val/test (80/10/10)
+           -> Qwen tokenizer -> 4-bit NF4 frozen Qwen2.5-1.5B + LoRA (r=16, attention + MLP, 1.2% trainable)
+           -> cross-entropy on answer tokens only -> backprop -> paged 8-bit AdamW -> LoRA adapter
 
-RAG INDEX  train-split answers -> 180-word chunks (40 overlap) -> bge-small-en-v1.5 -> FAISS IndexFlatIP
+RAG INDEX  train-split answers -> 180-word chunks (40 overlap) -> BAAI/bge-small-en-v1.5
+           -> FAISS IndexFlatIP (cosine), 22,449 chunks
 
-INFERENCE  question -> query embedding -> FAISS top-K -> question + context
+INFERENCE  question -> query embedding -> FAISS top-4 -> question + context
            -> Qwen2.5 + merged LoRA -> streamed answer + sources -> Gradio
 ```
 
 ## Results
-Fill in from the last cell of the notebook after your run (`eval_results.csv`).
+Training: 2,000 MedQuAD examples, 1 epoch (125 steps), single Kaggle T4 GPU.
+
+| Metric | Value |
+|---|---|
+| Validation loss | 1.213 |
+| Validation perplexity | 3.36 |
+
+Generation quality on 50 held-out test questions:
 
 | Model | ROUGE-L | BERTScore-F1 |
 |---|---|---|
-| Qwen2.5-7B-Instruct (base) | – | – |
-| + QLoRA fine-tuning | – | – |
-| + QLoRA + RAG | – | – |
+| Qwen2.5-1.5B-Instruct (base) | 0.140 | 0.773 |
+| + QLoRA fine-tuning | 0.240 | **0.807** |
+| + QLoRA + RAG | **0.263** | 0.800 |
 
-Validation loss / perplexity (fine-tuned): – / –
+![Training and validation loss](docs/loss_curve.png)
+
+**Takeaways**
+- QLoRA fine-tuning improved ROUGE-L by ~71% over the base model (0.140 → 0.240) and BERTScore-F1 from 0.773 to 0.807.
+- RAG raised lexical overlap further (ROUGE-L 0.263) while BERTScore stayed about the same.
+- Limitations: the evaluation set is small (n = 50), and manual review shows the 1.5B model can still state
+  incorrect medical facts (e.g. inheritance patterns) even with retrieved context. Larger models, a
+  stricter grounding prompt, and faithfulness evaluation are natural next steps.
 
 ## Repository layout
 ```
 notebooks/MedAI_QLoRA_RAG_pipeline.ipynb   end-to-end: data -> QLoRA -> eval -> FAISS -> deploy
-notebooks/00_original_exploration.ipynb    first version (kept for reference)
-space/app.py            Gradio app (ZeroGPU-ready, streaming, shows retrieved sources)
+space/app.py            Gradio app (streaming, shows retrieved sources, ZeroGPU-ready)
 space/rag.py            cleaning, split, chunking, embeddings, FAISS, prompt building
-space/requirements.txt  Space dependencies
-space/README.md         Hugging Face Space config
-docs/                   project flow notes (PDF) and DEPLOY.md
+space/requirements.txt  app dependencies
+docs/                   project flow notes, deployment guide, loss curve
 ```
 
-## Reproduce
-See [docs/DEPLOY.md](docs/DEPLOY.md). In short: open the notebook on Kaggle/Colab with a GPU, set your
-GitHub URL and HF username in the config cell, and run all cells.
+## Run the demo
+The Gradio app runs on any GPU notebook (e.g. Kaggle T4):
+```python
+!pip install -q -U transformers peft accelerate sentence-transformers faiss-cpu datasets gradio
+!git clone https://github.com/gollasudheerbabu09-debug/Medical_ChatBot_002.git
+%cd Medical_ChatBot_002/space
+!sed -i 's/torch.bfloat16 if use_gpu/torch.float16 if use_gpu/' app.py
+import os
+os.environ["BASE_MODEL"] = "Qwen/Qwen2.5-1.5B-Instruct"
+os.environ["ADAPTER_ID"] = "Sudheer2002/qwen2.5-1.5b-medquad-qlora"
+import app
+app.demo.queue().launch(share=True)
+```
 
 ## Design notes
-- **Loss on answers only**: prompt tokens are masked with `-100`, and Qwen's own pad token is kept, so the
-  model learns the `<|im_end|>` stop token.
-- **Dynamic padding at 512 tokens** instead of padding to 2048 cuts training compute several-fold.
+- **Loss on answers only**: prompt tokens are masked with `-100`, and Qwen's own pad token is kept so the model learns the `<|im_end|>` stop token.
+- **Dynamic padding at 512 tokens** instead of padding to 2048 cut training tokens by ~6.7×.
 - **No test leakage in RAG**: answers that appear in the test split are excluded from the FAISS index.
-- **4-bit for training, bf16 for serving**: QLoRA trains cheaply; on a GPU Space the adapter is merged into a bf16 base.
